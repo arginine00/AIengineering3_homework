@@ -12,3 +12,5 @@ scikit-learn>=1.5.0
 segmentation-models-pytorch>=0.3.3
 psutil>=5.9.8
 plotly>=5.24.0
+pyinstaller>=6.0.0
+PySide6>=6.7.0
