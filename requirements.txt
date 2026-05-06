@@ -1,0 +1,14 @@
+streamlit>=1.35.0
+Pillow>=10.0.0
+transformers>=4.40.0
+torch>=2.2.0
+clip-interrogator>=0.6.0
+huggingface-hub>=0.23.0
+onnxruntime>=1.18.0
+numpy>=1.26.0
+pandas>=2.2.0
+
+scikit-learn>=1.5.0
+segmentation-models-pytorch>=0.3.3
+psutil>=5.9.8
+plotly>=5.24.0
