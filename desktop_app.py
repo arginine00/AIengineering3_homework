@@ -53,7 +53,17 @@ from PySide6.QtWidgets import (
 
 MAJOR_IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif", ".tif", ".tiff"}
 DEFAULT_ALWAYS_EXTS = ".png, .jpg, .jpeg, .webp, .bmp, .tif"
-PROMPT_KEYS = ["parameters", "prompt", "Prompt", "Comment", "Description", "tags"]
+PROMPT_KEYS = ["parameters", "prompt", "Prompt", "Comment", "Description", "tags", "group_tags"]
+TAG_CATEGORY_RULES = [
+    ("人数", ["solo", "1girl", "1boy", "2girls", "2boys", "multiple", "girls", "boys", "group"]),
+    ("姿勢", ["standing", "sitting", "lying", "kneeling", "walking", "running", "pose", "looking", "facing", "from "]),
+    ("背景", ["background", "outdoors", "indoors", "sky", "street", "room", "forest", "beach", "city", "night", "day"]),
+    ("キャラ名", ["(", ")"]),
+    ("作品名", ["series", "copyright", "kantai", "genshin", "touhou", "pokemon", "idolmaster", "fate"]),
+    ("顔", ["face", "eyes", "smile", "mouth", "nose", "blush", "expression", "crying", "laughing"]),
+    ("髪/目/色", ["hair", "eyes", "red ", "blue ", "green ", "black ", "white ", "blonde", "brown ", "pink ", "purple "]),
+    ("服装/パーツ", ["shirt", "dress", "skirt", "pants", "hat", "shoes", "sleeves", "ribbon", "tail", "ears", "wings"]),
+]
 TAGGER_MODELS = {
     "WD Tagger v3": "wd14",
     "DeepDanbooru": "deepdanbooru",
@@ -185,6 +195,14 @@ def parse_ext_text(text: str) -> set[str]:
     return {ext for ext in (normalize_ext(part) for part in re.split(r"[,;\s]+", text)) if ext}
 
 
+def normalize_tag_token(token: str) -> str:
+    return re.sub(r"[_-]+", " ", token).strip().lower()
+
+
+def parse_tag_text(text: str) -> set[str]:
+    return {tag for tag in (normalize_tag_token(part) for part in re.split(r"[,;\n\r\t|]+", text)) if len(tag) >= 2}
+
+
 def scan_folder_extensions(folder_path: str, include_subfolders: bool) -> dict[str, int]:
     folder = Path(folder_path)
     iterator = folder.rglob("*") if include_subfolders else folder.glob("*")
@@ -243,6 +261,74 @@ def has_generation_prompt(raw_image: Image.Image) -> bool:
     return bool(text and ("negative prompt:" in text or "steps:" in text or "sampler:" in text or "cfg scale:" in text))
 
 
+def tag_category(tag: str) -> str:
+    value = tag.lower()
+    for category, needles in TAG_CATEGORY_RULES:
+        if any(needle in value for needle in needles):
+            return category
+    return "その他"
+
+
+def display_tag_source(source: str) -> str:
+    return {
+        "wd14": "WD系",
+        "deepdanbooru": "DeepDanbooru",
+        "camie": "Camie",
+    }.get(source, source or "不明")
+
+
+def prompt_tag_set(item: ImageItem) -> set[str]:
+    text = extract_metadata_text(item.raw_image)
+    tokens = re.split(r"[,;\n\r\t /\\|]+", text.lower())
+    tags = {re.sub(r"[_-]+", " ", token).strip() for token in tokens}
+    return {tag for tag in tags if len(tag) >= 2}
+
+
+def group_tag_set(raw_image: Image.Image) -> set[str]:
+    text = raw_image.info.get("group_tags")
+    if not text:
+        return set()
+    return parse_tag_text(str(text))
+
+
+def tag_records(item: ImageItem, unknown_score: float = 1.0) -> list[dict]:
+    prompt_tags = prompt_tag_set(item)
+    group_tags = group_tag_set(item.raw_image)
+    stem_tokens = {
+        re.sub(r"[_-]+", " ", token).strip()
+        for token in re.split(r"[,;\n\r\t /\\|]+", item.path.stem.lower())
+        if len(token.strip()) >= 2
+    }
+    records = []
+    for tag in item.tags:
+        key = tag.lower()
+        if key in item.tag_scores:
+            source = display_tag_source(item.tag_model or "AIタグ")
+            score = float(item.tag_scores[key])
+        elif key in group_tags:
+            source = "グループタグ"
+            score = unknown_score
+        elif key in prompt_tags:
+            source = "生成Prompt/メタデータ"
+            score = unknown_score
+        elif key in stem_tokens:
+            source = "ファイル名"
+            score = unknown_score
+        else:
+            source = "不明"
+            score = unknown_score
+        records.append(
+            {
+                "tag": tag,
+                "source": source,
+                "score": score,
+                "category": tag_category(tag),
+            }
+        )
+    category_order = {category: index for index, (category, _needles) in enumerate(TAG_CATEGORY_RULES)}
+    return sorted(records, key=lambda row: (category_order.get(row["category"], 999), -row["score"], row["tag"]))
+
+
 def load_images_from_folder(
     folder_path: str,
     max_images: int,
@@ -273,7 +359,7 @@ def load_images_from_folder(
             image.thumbnail((max_side, max_side))
             name = str(path.relative_to(folder)) if include_subfolders else path.name
             tag_scores, tag_model = extract_ai_tag_scores(raw)
-            tags = extract_tags(path, raw) | set(tag_scores)
+            tags = extract_tags(path, raw) | set(tag_scores) | group_tag_set(raw)
             items.append(
                 ImageItem(
                     path=path,
@@ -304,6 +390,15 @@ def extract_exif(image: Image.Image) -> dict:
     return exif_data
 
 
+def add_existing_text_metadata(meta: PngImagePlugin.PngInfo, image: Image.Image, skip_keys: set[str] | None = None):
+    skip_keys = skip_keys or set()
+    for key, value in image.info.items():
+        if key in skip_keys:
+            continue
+        if isinstance(value, (str, int, float)):
+            meta.add_text(str(key), str(value))
+
+
 def save_tagged_png(item: ImageItem, scored_tags: list[tuple[str, float]], model_key: str = "") -> Path:
     tags_text = ", ".join(tag for tag, _score in scored_tags)
     scores_text = ", ".join(f"{tag}:{score:.4f}" for tag, score in scored_tags)
@@ -318,6 +413,11 @@ def save_tagged_png(item: ImageItem, scored_tags: list[tuple[str, float]], model
             counter += 1
 
     meta = PngImagePlugin.PngInfo()
+    add_existing_text_metadata(
+        meta,
+        item.raw_image,
+        {"tags", "ai_tags", "ai_tag_model", "source_file", "source_metadata"},
+    )
     existing_text = extract_metadata_text(item.raw_image)
     if existing_text:
         meta.add_text("source_metadata", existing_text)
@@ -326,6 +426,26 @@ def save_tagged_png(item: ImageItem, scored_tags: list[tuple[str, float]], model
     if model_key:
         meta.add_text("ai_tag_model", model_key)
     meta.add_text("source_file", str(item.path))
+    item.raw_image.convert("RGB").save(png_path, "PNG", pnginfo=meta)
+    return png_path
+
+
+def save_group_tags_to_png(item: ImageItem, tags: set[str]) -> Path:
+    current_tags = group_tag_set(item.raw_image)
+    merged_tags = sorted(current_tags | tags)
+    png_path = item.path if item.path.suffix.lower() == ".png" else item.path.with_suffix(".png")
+    if png_path != item.path and png_path.exists():
+        counter = 1
+        while True:
+            candidate = item.path.with_name(f"{item.path.stem}_group_{counter}.png")
+            if not candidate.exists():
+                png_path = candidate
+                break
+            counter += 1
+
+    meta = PngImagePlugin.PngInfo()
+    add_existing_text_metadata(meta, item.raw_image, {"group_tags"})
+    meta.add_text("group_tags", ", ".join(merged_tags))
     item.raw_image.convert("RGB").save(png_path, "PNG", pnginfo=meta)
     return png_path
 
@@ -854,7 +974,7 @@ class TsnePlotWindow(QMainWindow):
     def __init__(self, owner):
         super().__init__(owner)
         self.owner = owner
-        self.setWindowTitle("t-SNE / UMAP 繝励Ο繝・ヨ")
+        self.setWindowTitle("t-SNE / UMAP プロット")
         self.resize(1100, 760)
         self.plot_view = TsnePlotView(self)
         self.setCentralWidget(self.plot_view)
@@ -893,6 +1013,27 @@ class DetailWindow(QMainWindow):
         self.info_table.setEditTriggers(QTableWidget.NoEditTriggers)
 
         self.tag_buttons: dict[str, QPushButton] = {}
+        self.show_ai_tags = QCheckBox("AI")
+        self.show_prompt_tags = QCheckBox("Prompt")
+        self.show_group_tags = QCheckBox("グループ")
+        self.show_filename_tags = QCheckBox("ファイル名")
+        self.show_unknown_tags = QCheckBox("不明")
+        for checkbox in [
+            self.show_ai_tags,
+            self.show_prompt_tags,
+            self.show_group_tags,
+            self.show_filename_tags,
+            self.show_unknown_tags,
+        ]:
+            checkbox.setChecked(True)
+            checkbox.stateChanged.connect(self.update_info)
+        self.detail_min_score = QSpinBox()
+        self.detail_min_score.setRange(0, 100)
+        self.detail_min_score.setSuffix("%")
+        self.detail_min_score.valueChanged.connect(self.update_info)
+        self.unknown_score_mode = QComboBox()
+        self.unknown_score_mode.addItems(["値なし=1", "値なし=0"])
+        self.unknown_score_mode.currentIndexChanged.connect(self.update_info)
         self._build_ui()
 
     def _build_ui(self):
@@ -934,6 +1075,23 @@ class DetailWindow(QMainWindow):
         right = QWidget()
         right_layout = QVBoxLayout(right)
         right_layout.addWidget(tag_bar)
+        filter_bar = QWidget()
+        filter_layout = QHBoxLayout(filter_bar)
+        filter_layout.setContentsMargins(4, 0, 4, 4)
+        filter_layout.addWidget(QLabel("由来"))
+        for checkbox in [
+            self.show_ai_tags,
+            self.show_prompt_tags,
+            self.show_group_tags,
+            self.show_filename_tags,
+            self.show_unknown_tags,
+        ]:
+            filter_layout.addWidget(checkbox)
+        filter_layout.addWidget(QLabel("最小信頼度"))
+        filter_layout.addWidget(self.detail_min_score)
+        filter_layout.addWidget(self.unknown_score_mode)
+        filter_layout.addStretch(1)
+        right_layout.addWidget(filter_bar)
         right_layout.addWidget(self.info_table, 1)
 
         splitter = QSplitter(Qt.Horizontal)
@@ -987,12 +1145,31 @@ class DetailWindow(QMainWindow):
         ]
         exif_rows = [(f"EXIF:{key}", value) for key, value in extract_exif(item.raw_image).items()]
         prompt_rows = [(f"Prompt:{key}", value) for key, value in extract_prompt_entries(item.raw_image)]
+        unknown_score = 0.0 if self.unknown_score_mode.currentIndex() == 1 else 1.0
+        min_score = self.detail_min_score.value() / 100.0
+        allowed_sources = set()
+        if self.show_ai_tags.isChecked():
+            allowed_sources.update({"WD系", "DeepDanbooru", "Camie", "AIタグ"})
+        if self.show_prompt_tags.isChecked():
+            allowed_sources.add("生成Prompt/メタデータ")
+        if self.show_group_tags.isChecked():
+            allowed_sources.add("グループタグ")
+        if self.show_filename_tags.isChecked():
+            allowed_sources.add("ファイル名")
+        if self.show_unknown_tags.isChecked():
+            allowed_sources.add("不明")
+
         tag_rows = []
-        for tag in sorted(item.tags):
-            if tag in item.tag_scores:
-                tag_rows.append(("Tag", f"{tag} ({item.tag_scores[tag]:.4f})"))
-            else:
-                tag_rows.append(("Tag", tag))
+        current_category = None
+        for record in tag_records(item, unknown_score):
+            if record["source"] not in allowed_sources:
+                continue
+            if record["score"] < min_score:
+                continue
+            if record["category"] != current_category:
+                current_category = record["category"]
+                tag_rows.append((f"[{current_category}]", ""))
+            tag_rows.append((record["source"], f"{record['tag']} ({record['score']:.4f})"))
         if mode == "basic":
             return basic
         if mode == "exif":
@@ -1243,9 +1420,22 @@ class TileGroupWindow(QMainWindow):
         self.scroll.setWidget(self.container)
         start_button = QPushButton("このグループでスライドショー")
         start_button.clicked.connect(self.start_group_slideshow)
+        self.group_tag_input = QLineEdit()
+        self.group_tag_input.setPlaceholderText("例: blue background, standing pose")
+        add_group_tag_button = QPushButton("グループタグを追加")
+        add_group_tag_button.clicked.connect(self.add_group_tags)
+
+        action_row = QWidget()
+        action_layout = QHBoxLayout(action_row)
+        action_layout.setContentsMargins(0, 0, 0, 0)
+        action_layout.addWidget(start_button)
+        action_layout.addWidget(QLabel("グループタグ"))
+        action_layout.addWidget(self.group_tag_input, 1)
+        action_layout.addWidget(add_group_tag_button)
+
         wrapper = QWidget()
         layout = QVBoxLayout(wrapper)
-        layout.addWidget(start_button)
+        layout.addWidget(action_row)
         layout.addWidget(self.scroll, 1)
         self.setCentralWidget(wrapper)
         self.indexes: list[int] = []
@@ -1266,6 +1456,14 @@ class TileGroupWindow(QMainWindow):
 
     def start_group_slideshow(self):
         self.owner.start_slideshow_for_indexes(self.indexes)
+
+    def add_group_tags(self):
+        tags = parse_tag_text(self.group_tag_input.text())
+        if not tags:
+            QMessageBox.information(self, "グループタグ", "追加するタグを入力してください。")
+            return
+        self.owner.add_group_tags_to_indexes(self.indexes, tags)
+        self.group_tag_input.clear()
 
 
 class TaggingWorker(QObject):
@@ -1648,8 +1846,6 @@ class ImageFolderViewer(QMainWindow):
         self.selected_index = index
         if open_detail:
             self.open_detail_window()
-        elif self.detail_window is not None and self.detail_window.isVisible() and not self.detail_frozen:
-            self.detail_window.set_item(self.items[index])
         if self.slideshow_window is not None and self.slideshow_window.isVisible():
             self.slideshow_window.set_item(self.items[index])
         self.statusBar().showMessage(f"{index + 1}/{len(self.items)}: {self.items[index].name}")
@@ -1662,8 +1858,80 @@ class ImageFolderViewer(QMainWindow):
         self.tsne_group_window.raise_()
         self.tsne_group_window.activateWindow()
 
+    def refresh_item_after_metadata_save(self, item: ImageItem, new_path: Path):
+        old_side = max(item.image.width, item.image.height, 1)
+        item.path = new_path
+        try:
+            root = Path(self.folder_input.text().strip())
+            if root and item.path.is_relative_to(root):
+                item.name = str(item.path.relative_to(root)) if self.include_subfolders.isChecked() else item.path.name
+            else:
+                item.name = item.path.name
+        except Exception:
+            item.name = item.path.name
+        item.bytes_data = item.path.read_bytes()
+        item.raw_image = Image.open(io.BytesIO(item.bytes_data))
+        item.image = item.raw_image.convert("RGB")
+        item.image.thumbnail((old_side, old_side))
+        tag_scores, tag_model = extract_ai_tag_scores(item.raw_image)
+        item.tag_scores = tag_scores
+        if tag_model:
+            item.tag_model = tag_model
+        item.tags = extract_tags(item.path, item.raw_image) | set(tag_scores) | group_tag_set(item.raw_image)
+
+    def add_group_tags_to_indexes(self, indexes: list[int], tags: set[str]):
+        valid_indexes = [index for index in indexes if 0 <= index < len(self.items)]
+        if not valid_indexes:
+            return
+        converted_originals: list[Path] = []
+        errors: list[str] = []
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        try:
+            for index in valid_indexes:
+                item = self.items[index]
+                old_path = item.path
+                try:
+                    png_path = save_group_tags_to_png(item, tags)
+                    self.refresh_item_after_metadata_save(item, png_path)
+                    if png_path != old_path:
+                        converted_originals.append(old_path)
+                except Exception as exc:
+                    item.tags.update(tags)
+                    errors.append(f"{item.name}: {exc}")
+        finally:
+            QApplication.restoreOverrideCursor()
+
+        if converted_originals:
+            answer = QMessageBox.question(
+                self,
+                "元画像の削除確認",
+                f"グループタグ保存のためPNGに変換した元画像が {len(converted_originals)} 件あります。\n元画像を削除しますか？",
+            )
+            if answer == QMessageBox.Yes:
+                for path in converted_originals:
+                    try:
+                        if Path(path).exists():
+                            Path(path).unlink()
+                    except Exception as exc:
+                        errors.append(f"{path.name}: {exc}")
+
+        self.populate_tags()
+        self.render_tiles()
+        if self.detail_window is not None and self.detail_window.item is not None:
+            if any(self.detail_window.item is self.items[index] for index in valid_indexes):
+                self.detail_window.set_item(self.detail_window.item)
+            else:
+                self.detail_window.update_info()
+        if self.tsne_group_window is not None and self.tsne_group_window.isVisible():
+            self.tsne_group_window.set_indexes(self.tsne_group_window.indexes)
+
+        message = f"グループタグを {len(valid_indexes)} 件に追加しました: {', '.join(sorted(tags))}"
+        self.statusBar().showMessage(message)
+        if errors:
+            QMessageBox.warning(self, "グループタグ", "一部の保存に失敗しました:\n" + "\n".join(errors[:10]))
+
     def parse_tag_input(self, text: str) -> set[str]:
-        return {part.strip().lower() for part in re.split(r"[,;\n]+", text) if part.strip()}
+        return parse_tag_text(text)
 
     def apply_tag_filter(self):
         and_tags = self.parse_tag_input(self.and_input.text())
@@ -1712,14 +1980,16 @@ class ImageFolderViewer(QMainWindow):
         indexes = self.active_navigation_indexes()
         if indexes:
             pos = (self.visible_position() - 1) % len(indexes)
-            update_detail = self.detail_window is not None and not self.detail_frozen
+            in_slideshow = self.slideshow_window is not None and self.slideshow_window.isVisible()
+            update_detail = self.detail_window is not None and not self.detail_frozen and not in_slideshow
             self.select_image(indexes[pos], open_detail=update_detail)
 
     def next_image(self):
         indexes = self.active_navigation_indexes()
         if indexes:
             pos = (self.visible_position() + 1) % len(indexes)
-            update_detail = self.detail_window is not None and not self.detail_frozen
+            in_slideshow = self.slideshow_window is not None and self.slideshow_window.isVisible()
+            update_detail = self.detail_window is not None and not self.detail_frozen and not in_slideshow
             self.select_image(indexes[pos], open_detail=update_detail)
 
     def start_slideshow(self):
