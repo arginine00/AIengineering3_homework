@@ -1,0 +1,10 @@
+dist/
+IntegratedTagViewer/
+models/
+*.onnx
+*.bin
+*.pt
+*.pth
+*.dll
+*.pyd
+*.exe
