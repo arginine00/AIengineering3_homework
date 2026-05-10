@@ -1,10 +1,31 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+env/
+
+# build outputs
 dist/
+build/
 IntegratedTagViewer/
+cache/
+tag_thresholds_user.json
+
+# model / large files
 models/
 *.onnx
 *.bin
 *.pt
 *.pth
+*.safetensors
+
+# executable / binary artifacts
+*.exe
 *.dll
 *.pyd
-*.exe
+
+# editor / OS
+.vscode/
+.DS_Store
+Thumbs.db
