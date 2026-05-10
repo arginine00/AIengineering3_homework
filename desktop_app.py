@@ -1,14 +1,20 @@
 ﻿import importlib
+import configparser
 import csv
 import io
+import json
 import os
 import re
+import shutil
 import site
+import subprocess
 import sys
+import tempfile
 import time
 import traceback
 import urllib.parse
 import urllib.request
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -91,6 +97,72 @@ MODEL_FILE_GROUPS = {
     ],
 }
 ONNX_SESSION_CACHE = {}
+TRANSLATION_MODEL_DIRNAME = "tag_translation"
+TAG_DICTIONARY_DIRNAME = "tag_dictionary"
+TRANSLATION_MODEL_REPO = "Helsinki-NLP/opus-mt-en-jap"
+TRANSLATION_REQUIRED_FILES = {
+    "config.json",
+    "generation_config.json",
+    "pytorch_model.bin",
+    "source.spm",
+    "target.spm",
+    "tokenizer_config.json",
+    "vocab.json",
+}
+BUILTIN_TAG_TRANSLATIONS = {
+    "1boy": "男性1人",
+    "1girl": "女性1人",
+    "2boys": "男性2人",
+    "2girls": "女性2人",
+    "animal ears": "獣耳",
+    "arms up": "腕を上げる",
+    "bare shoulders": "肩出し",
+    "beach": "砂浜",
+    "black eyes": "黒い目",
+    "black hair": "黒髪",
+    "blue background": "青い背景",
+    "blue eyes": "青い目",
+    "blue hair": "青髪",
+    "blonde hair": "金髪",
+    "blush": "赤面",
+    "brown eyes": "茶色の目",
+    "brown hair": "茶髪",
+    "city": "街",
+    "closed eyes": "閉じた目",
+    "dress": "ドレス",
+    "face": "顔",
+    "forest": "森",
+    "green eyes": "緑の目",
+    "green hair": "緑髪",
+    "hair ornament": "髪飾り",
+    "hat": "帽子",
+    "indoors": "屋内",
+    "long hair": "長髪",
+    "looking at viewer": "こちらを見る",
+    "lying": "横たわる",
+    "multiple girls": "複数の女性",
+    "night": "夜",
+    "open mouth": "開いた口",
+    "outdoors": "屋外",
+    "pink hair": "ピンク髪",
+    "purple eyes": "紫の目",
+    "red eyes": "赤い目",
+    "red hair": "赤髪",
+    "ribbon": "リボン",
+    "short hair": "短髪",
+    "sitting": "座る",
+    "sky": "空",
+    "skirt": "スカート",
+    "smile": "笑顔",
+    "solo": "1人",
+    "standing": "立つ",
+    "street": "通り",
+    "tail": "尻尾",
+    "twintails": "ツインテール",
+    "white background": "白背景",
+    "white hair": "白髪",
+    "yellow eyes": "黄色い目",
+}
 
 os.environ.setdefault("HF_HUB_DISABLE_XET", "1")
 os.environ.setdefault("HF_HUB_ENABLE_HF_TRANSFER", "0")
@@ -167,6 +239,94 @@ def default_model_dir() -> Path:
     return app_base_dir() / "models"
 
 
+def user_translation_path() -> Path:
+    return app_base_dir() / "tag_translations_user.json"
+
+
+def default_translation_model_dir() -> Path:
+    return default_model_dir() / TRANSLATION_MODEL_DIRNAME
+
+
+def default_tag_dictionary_path() -> Path:
+    dictionary_dir = default_model_dir() / TAG_DICTIONARY_DIRNAME
+    preferred = dictionary_dir / "Danbooru_JPTag_over100used.csv"
+    if preferred.exists():
+        return preferred
+    fallback = dictionary_dir / "danbooru_jp.csv"
+    if fallback.exists():
+        return fallback
+    return preferred
+
+
+def translation_model_ready(model_dir: Path) -> bool:
+    return all((model_dir / filename).exists() for filename in TRANSLATION_REQUIRED_FILES)
+
+
+def external_python_commands() -> list[list[str]]:
+    commands: list[list[str]] = []
+    candidates: list[Path] = []
+    base_executable = getattr(sys, "_base_executable", "")
+    if base_executable:
+        candidates.append(Path(base_executable))
+    python_path = shutil.which("python")
+    if python_path:
+        candidates.append(Path(python_path))
+    py_path = shutil.which("py")
+    if py_path:
+        commands.append([py_path, "-3"])
+    local_appdata = os.environ.get("LOCALAPPDATA")
+    if local_appdata:
+        candidates.extend(Path(local_appdata).glob("Programs/Python/Python*/python.exe"))
+    seen = set()
+    for candidate in candidates:
+        try:
+            resolved = candidate.resolve()
+        except Exception:
+            resolved = candidate
+        key = str(resolved).lower()
+        if key in seen or not resolved.exists() or not resolved.name.lower().startswith("python"):
+            continue
+        seen.add(key)
+        commands.append([str(resolved)])
+    return commands
+
+
+def run_external_python(code: str, args: list[str], timeout: int = 300) -> subprocess.CompletedProcess:
+    errors = []
+    env = os.environ.copy()
+    env.setdefault("PYTHONUTF8", "1")
+    env.setdefault("PYTHONIOENCODING", "utf-8")
+    env.setdefault("HF_HUB_DISABLE_XET", "1")
+    env.setdefault("HF_HUB_ENABLE_HF_TRANSFER", "0")
+    env.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
+    startupinfo = None
+    creationflags = 0
+    if os.name == "nt":
+        startupinfo = subprocess.STARTUPINFO()
+        startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+        startupinfo.wShowWindow = 0
+        creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    for command in external_python_commands():
+        try:
+            result = subprocess.run(
+                command + ["-B", "-c", code, *args],
+                cwd=str(app_base_dir()),
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+                startupinfo=startupinfo,
+                creationflags=creationflags,
+            )
+        except Exception as exc:
+            errors.append(f"{' '.join(command)}: {exc}")
+            continue
+        if result.returncode == 0:
+            return result
+        errors.append(f"{' '.join(command)}: {result.stderr or result.stdout}")
+    raise RuntimeError("外部Pythonで処理を実行できませんでした。\n" + "\n".join(errors[-3:]))
+
+
 for package_path in iter_external_site_packages():
     if package_path and package_path not in sys.path:
         sys.path.append(package_path)
@@ -201,6 +361,110 @@ def normalize_tag_token(token: str) -> str:
 
 def parse_tag_text(text: str) -> set[str]:
     return {tag for tag in (normalize_tag_token(part) for part in re.split(r"[,;\n\r\t|]+", text)) if len(tag) >= 2}
+
+
+def clean_translated_text(text: str) -> str:
+    text = re.sub(r"\s+", " ", text).strip()
+    japanese = r"\u3040-\u30ff\u3400-\u9fff"
+    text = re.sub(fr"(?<=[{japanese}])\s+(?=[{japanese}])", "", text)
+    text = re.sub(r"\s+([。、,.!?！？])", r"\1", text)
+    return text
+
+
+def looks_mojibake(text: str) -> bool:
+    if not text:
+        return False
+    bad_chars = sum(text.count(ch) for ch in "縺繧繝荳蟄逶邱�")
+    return bad_chars >= max(2, len(text) // 3)
+
+
+class TagTranslationStore:
+    def __init__(self, path: Path | None = None):
+        self.path = path or user_translation_path()
+        self.user_translations: dict[str, str] = {}
+        self.external_translations: dict[str, str] = {}
+        self.load()
+
+    def load(self):
+        self.user_translations = {}
+        if not self.path.exists():
+            return
+        try:
+            data = json.loads(self.path.read_text(encoding="utf-8"))
+        except Exception:
+            return
+        if isinstance(data, dict):
+            self.user_translations = {
+                normalize_tag_token(str(key)): str(value).strip()
+                for key, value in data.items()
+                if str(key).strip() and str(value).strip()
+            }
+
+    def save(self):
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        data = dict(sorted(self.user_translations.items()))
+        self.path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    def load_external_csv(self, path: Path) -> tuple[int, int]:
+        translations: dict[str, str] = {}
+        skipped = 0
+        if not path.exists():
+            self.external_translations = {}
+            return 0, 0
+        with path.open("r", encoding="utf-8-sig", newline="") as handle:
+            reader = csv.reader(handle)
+            for row in reader:
+                if len(row) < 2:
+                    skipped += 1
+                    continue
+                english = normalize_tag_token(row[0])
+                japanese = str(row[1]).strip()
+                if not english or not japanese or english in {"english_tag", "tag"}:
+                    skipped += 1
+                    continue
+                if looks_mojibake(japanese):
+                    skipped += 1
+                    continue
+                translations[english] = japanese
+        self.external_translations = translations
+        return len(translations), skipped
+
+    def translate(self, tag: str) -> str:
+        key = normalize_tag_token(tag)
+        return self.user_translations.get(key) or self.external_translations.get(key) or BUILTIN_TAG_TRANSLATIONS.get(key, "")
+
+    def set_translation(self, tag: str, japanese: str):
+        key = normalize_tag_token(tag)
+        value = japanese.strip()
+        if not key:
+            return
+        if value:
+            self.user_translations[key] = value
+        else:
+            self.user_translations.pop(key, None)
+        self.save()
+
+    def merge_translations(self, translations: dict[str, str]):
+        changed = False
+        for tag, japanese in translations.items():
+            key = normalize_tag_token(tag)
+            value = japanese.strip()
+            if key and value and not self.translate(key):
+                self.user_translations[key] = value
+                changed = True
+        if changed:
+            self.save()
+
+    def all_rows(self):
+        keys = sorted(set(BUILTIN_TAG_TRANSLATIONS) | set(self.external_translations) | set(self.user_translations))
+        return [
+            (
+                key,
+                self.external_translations.get(key) or BUILTIN_TAG_TRANSLATIONS.get(key, ""),
+                self.user_translations.get(key, ""),
+            )
+            for key in keys
+        ]
 
 
 def scan_folder_extensions(folder_path: str, include_subfolders: bool) -> dict[str, int]:
@@ -1011,6 +1275,8 @@ class DetailWindow(QMainWindow):
         self.info_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
         self.info_table.verticalHeader().setVisible(False)
         self.info_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.info_table.itemChanged.connect(self.on_info_item_changed)
+        self.updating_table = False
 
         self.tag_buttons: dict[str, QPushButton] = {}
         self.show_ai_tags = QCheckBox("AI")
@@ -1125,11 +1391,53 @@ class DetailWindow(QMainWindow):
     def update_info(self):
         if not self.item:
             return
-        rows = self.rows_for_mode(self.current_mode())
+        mode = self.current_mode()
+        rows = self.rows_for_mode(mode)
+        is_tag_mode = mode == "tags"
+        self.updating_table = True
+        self.info_table.blockSignals(True)
+        self.info_table.clear()
+        if is_tag_mode:
+            self.info_table.setColumnCount(4)
+            self.info_table.setHorizontalHeaderLabels(["由来", "英語タグ", "日本語", "信頼度"])
+            self.info_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
+            self.info_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
+            self.info_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.Stretch)
+            self.info_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeToContents)
+            self.info_table.setEditTriggers(QTableWidget.DoubleClicked | QTableWidget.EditKeyPressed)
+        else:
+            self.info_table.setColumnCount(2)
+            self.info_table.setHorizontalHeaderLabels(["項目", "値"])
+            self.info_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
+            self.info_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
+            self.info_table.setEditTriggers(QTableWidget.NoEditTriggers)
         self.info_table.setRowCount(len(rows))
-        for row, (key, value) in enumerate(rows):
-            self.info_table.setItem(row, 0, QTableWidgetItem(str(key)))
-            self.info_table.setItem(row, 1, QTableWidgetItem(str(value)))
+        for row, values in enumerate(rows):
+            for col, value in enumerate(values):
+                cell = QTableWidgetItem(str(value))
+                editable = is_tag_mode and col == 2 and not str(values[0]).startswith("[")
+                if not editable:
+                    cell.setFlags(cell.flags() & ~Qt.ItemIsEditable)
+                self.info_table.setItem(row, col, cell)
+        self.info_table.blockSignals(False)
+        self.updating_table = False
+
+    def on_info_item_changed(self, item: QTableWidgetItem):
+        if self.updating_table or self.current_mode() != "tags" or item.column() != 2:
+            return
+        english_item = self.info_table.item(item.row(), 1)
+        if english_item is None:
+            return
+        english = normalize_tag_token(english_item.text())
+        if not english:
+            return
+        self.owner.translation_store.set_translation(english, item.text())
+        self.owner.statusBar().showMessage(f"タグ翻訳を保存しました: {english}")
+
+    def translated_tag(self, tag: str) -> str:
+        if not getattr(self.owner, "show_tag_translations", None) or not self.owner.show_tag_translations.isChecked():
+            return ""
+        return self.owner.translation_store.translate(tag)
 
     def rows_for_mode(self, mode: str):
         item = self.item
@@ -1168,8 +1476,8 @@ class DetailWindow(QMainWindow):
                 continue
             if record["category"] != current_category:
                 current_category = record["category"]
-                tag_rows.append((f"[{current_category}]", ""))
-            tag_rows.append((record["source"], f"{record['tag']} ({record['score']:.4f})"))
+                tag_rows.append((f"[{current_category}]", "", "", ""))
+            tag_rows.append((record["source"], record["tag"], self.translated_tag(record["tag"]), f"{record['score']:.4f}"))
         if mode == "basic":
             return basic
         if mode == "exif":
@@ -1177,8 +1485,15 @@ class DetailWindow(QMainWindow):
         if mode == "prompt":
             return prompt_rows or [("Prompt", "なし")]
         if mode == "tags":
-            return tag_rows or [("Tag", "なし")]
-        return basic + exif_rows + prompt_rows + tag_rows
+            return tag_rows or [("Tag", "なし", "", "")]
+        compact_tag_rows = []
+        for row in tag_rows:
+            if row[0].startswith("["):
+                compact_tag_rows.append((row[0], ""))
+            else:
+                japanese = f" / {row[2]}" if row[2] else ""
+                compact_tag_rows.append((f"Tag:{row[0]}", f"{row[1]}{japanese} ({row[3]})"))
+        return basic + exif_rows + prompt_rows + compact_tag_rows
 
 
 class SlideshowWindow(QMainWindow):
@@ -1386,7 +1701,7 @@ class DuplicateReviewWindow(QMainWindow):
 
 
 class TileWidget(QWidget):
-    def __init__(self, item: ImageItem, index: int, tile_size: int, on_select):
+    def __init__(self, item: ImageItem, index: int, tile_size: int, on_select, pixmap: QPixmap | None = None):
         super().__init__()
         self.index = index
         self.on_select = on_select
@@ -1398,7 +1713,8 @@ class TileWidget(QWidget):
         self.button = QPushButton()
         self.button.setFixedSize(tile_size, tile_size)
         self.button.clicked.connect(lambda: self.on_select(self.index))
-        pixmap = pil_to_pixmap(item.image).scaled(tile_size, tile_size, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+        if pixmap is None:
+            pixmap = pil_to_pixmap(item.image).scaled(tile_size, tile_size, Qt.KeepAspectRatio, Qt.FastTransformation)
         self.button.setIcon(pixmap)
         self.button.setIconSize(pixmap.size())
         layout.addWidget(self.button, alignment=Qt.AlignCenter)
@@ -1466,6 +1782,229 @@ class TileGroupWindow(QMainWindow):
         self.group_tag_input.clear()
 
 
+class TranslationDictionaryWindow(QMainWindow):
+    def __init__(self, owner):
+        super().__init__(owner)
+        self.owner = owner
+        self.setWindowTitle("タグ翻訳辞書")
+        self.resize(760, 620)
+        self.table = QTableWidget(0, 3)
+        self.table.setHorizontalHeaderLabels(["英語タグ", "内蔵翻訳", "ユーザー翻訳"])
+        self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self.table.verticalHeader().setVisible(False)
+        self._build_ui()
+        self.reload()
+
+    def _build_ui(self):
+        add_button = QPushButton("行を追加")
+        save_button = QPushButton("保存")
+        reload_button = QPushButton("再読み込み")
+        add_button.clicked.connect(self.add_empty_row)
+        save_button.clicked.connect(self.save)
+        reload_button.clicked.connect(self.reload)
+
+        button_row = QWidget()
+        button_layout = QHBoxLayout(button_row)
+        button_layout.addWidget(add_button)
+        button_layout.addStretch(1)
+        button_layout.addWidget(reload_button)
+        button_layout.addWidget(save_button)
+
+        container = QWidget()
+        layout = QVBoxLayout(container)
+        layout.addWidget(self.table, 1)
+        layout.addWidget(button_row)
+        self.setCentralWidget(container)
+
+    def add_empty_row(self):
+        row = self.table.rowCount()
+        self.table.insertRow(row)
+        self.table.setItem(row, 0, QTableWidgetItem(""))
+        builtin_item = QTableWidgetItem("")
+        builtin_item.setFlags(builtin_item.flags() & ~Qt.ItemIsEditable)
+        self.table.setItem(row, 1, builtin_item)
+        self.table.setItem(row, 2, QTableWidgetItem(""))
+
+    def reload(self):
+        rows = self.owner.translation_store.all_rows()
+        self.table.setRowCount(len(rows))
+        for row, (english, builtin, user_value) in enumerate(rows):
+            english_item = QTableWidgetItem(english)
+            builtin_item = QTableWidgetItem(builtin)
+            builtin_item.setFlags(builtin_item.flags() & ~Qt.ItemIsEditable)
+            user_item = QTableWidgetItem(user_value)
+            self.table.setItem(row, 0, english_item)
+            self.table.setItem(row, 1, builtin_item)
+            self.table.setItem(row, 2, user_item)
+
+    def save(self):
+        translations: dict[str, str] = {}
+        for row in range(self.table.rowCount()):
+            english_item = self.table.item(row, 0)
+            user_item = self.table.item(row, 2)
+            if not english_item:
+                continue
+            english = normalize_tag_token(english_item.text())
+            japanese = user_item.text().strip() if user_item else ""
+            if english and japanese:
+                translations[english] = japanese
+        self.owner.translation_store.user_translations = translations
+        self.owner.translation_store.save()
+        self.owner.refresh_translation_views()
+        self.owner.statusBar().showMessage("タグ翻訳辞書を保存しました。")
+
+
+class TranslationWorker(QObject):
+    finished = Signal(dict)
+    error = Signal(str)
+
+    def __init__(self, tags: list[str], model_dir: Path):
+        super().__init__()
+        self.tags = tags
+        self.model_dir = model_dir
+
+    def run(self):
+        try:
+            if not self.model_dir.exists():
+                raise FileNotFoundError(f"翻訳モデルフォルダが見つかりません: {self.model_dir}")
+            if not translation_model_ready(self.model_dir):
+                missing = sorted(filename for filename in TRANSLATION_REQUIRED_FILES if not (self.model_dir / filename).exists())
+                raise FileNotFoundError("翻訳モデルの必要ファイルが不足しています: " + ", ".join(missing))
+            with tempfile.TemporaryDirectory(prefix="tag_translate_") as temp_dir:
+                input_path = Path(temp_dir) / "input.json"
+                output_path = Path(temp_dir) / "output.json"
+                input_path.write_text(
+                    json.dumps({"tags": self.tags, "model_dir": str(self.model_dir)}, ensure_ascii=False),
+                    encoding="utf-8",
+                )
+                code = r'''
+import json
+import sys
+from pathlib import Path
+
+import torch
+from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
+
+input_path = Path(sys.argv[1])
+output_path = Path(sys.argv[2])
+payload = json.loads(input_path.read_text(encoding="utf-8"))
+tags = payload["tags"]
+model_dir = payload["model_dir"]
+tokenizer = AutoTokenizer.from_pretrained(model_dir, local_files_only=True)
+model = AutoModelForSeq2SeqLM.from_pretrained(model_dir, local_files_only=True)
+model.eval()
+translations = {}
+for start in range(0, len(tags), 16):
+    batch_tags = tags[start:start + 16]
+    texts = [tag.replace("_", " ") for tag in batch_tags]
+    inputs = tokenizer(texts, return_tensors="pt", padding=True, truncation=True)
+    with torch.no_grad():
+        generated = model.generate(**inputs, max_length=48, renormalize_logits=True)
+    decoded = tokenizer.batch_decode(generated, skip_special_tokens=True)
+    for tag, translated in zip(batch_tags, decoded):
+        translated = str(translated).strip()
+        if translated:
+            translations[tag] = translated
+output_path.write_text(json.dumps(translations, ensure_ascii=False), encoding="utf-8")
+'''
+                run_external_python(code, [str(input_path), str(output_path)], timeout=900)
+                translations = {
+                    str(tag): clean_translated_text(str(translated))
+                    for tag, translated in json.loads(output_path.read_text(encoding="utf-8")).items()
+                    if str(translated).strip()
+                }
+            self.finished.emit(translations)
+        except Exception:
+            self.error.emit(traceback.format_exc())
+
+
+class ImageLoadWorker(QObject):
+    batch_loaded = Signal(list)
+    progress = Signal(int, int)
+    finished = Signal(dict)
+    error = Signal(str)
+
+    def __init__(
+        self,
+        folder_path: str,
+        max_images: int,
+        max_side: int,
+        include_subfolders: bool,
+        enabled_exts: set[str],
+    ):
+        super().__init__()
+        self.folder_path = folder_path
+        self.max_images = max_images
+        self.max_side = max_side
+        self.include_subfolders = include_subfolders
+        self.enabled_exts = enabled_exts
+        self.stop_requested = False
+
+    def stop(self):
+        self.stop_requested = True
+
+    def run(self):
+        try:
+            folder = Path(self.folder_path)
+            iterator = folder.rglob("*") if self.include_subfolders else folder.glob("*")
+            batch: list[ImageItem] = []
+            skipped: dict[str, int] = {}
+            loaded = 0
+            scanned = 0
+            last_emit = time.monotonic()
+
+            for path in iterator:
+                if self.stop_requested or loaded >= self.max_images:
+                    break
+                scanned += 1
+                if path.is_dir():
+                    continue
+
+                ext = path.suffix.lower()
+                if ext not in self.enabled_exts:
+                    skipped[ext or "(no_ext)"] = skipped.get(ext or "(no_ext)", 0) + 1
+                    continue
+
+                try:
+                    bytes_data = path.read_bytes()
+                    raw = Image.open(io.BytesIO(bytes_data))
+                    image = raw.convert("RGB")
+                    image.thumbnail((self.max_side, self.max_side))
+                    name = str(path.relative_to(folder)) if self.include_subfolders else path.name
+                    tag_scores, tag_model = extract_ai_tag_scores(raw)
+                    tags = extract_tags(path, raw) | set(tag_scores) | group_tag_set(raw)
+                    batch.append(
+                        ImageItem(
+                            path=path,
+                            name=name,
+                            image=image,
+                            raw_image=raw,
+                            bytes_data=bytes_data,
+                            tags=tags,
+                            tag_scores=tag_scores,
+                            tag_model=tag_model,
+                        )
+                    )
+                    loaded += 1
+                except Exception:
+                    key = f"{ext or '(no_ext)'}(read_error)"
+                    skipped[key] = skipped.get(key, 0) + 1
+
+                now = time.monotonic()
+                if len(batch) >= 12 or (batch and now - last_emit >= 0.25):
+                    self.batch_loaded.emit(batch)
+                    batch = []
+                    last_emit = now
+                    self.progress.emit(loaded, scanned)
+
+            if batch:
+                self.batch_loaded.emit(batch)
+            self.progress.emit(loaded, scanned)
+            self.finished.emit(skipped)
+        except Exception:
+            self.error.emit(traceback.format_exc())
+
+
 class TaggingWorker(QObject):
     progress = Signal(int, int)
     finished = Signal(list, list)
@@ -1514,14 +2053,24 @@ class ImageFolderViewer(QMainWindow):
         self.slideshow_indexes: list[int] | None = None
         self.selected_index = -1
         self.tile_widgets: list[TileWidget] = []
+        self.tile_pixmap_cache: dict[tuple[int, int], QPixmap] = {}
+        self.last_tile_columns = 0
+        self.last_tile_size = 0
         self.detail_window: DetailWindow | None = None
         self.detail_frozen = False
         self.slideshow_window: SlideshowWindow | None = None
         self.duplicate_window: DuplicateWindow | None = None
         self.tsne_window: TsnePlotWindow | None = None
         self.tsne_group_window: TileGroupWindow | None = None
+        self.loading_thread: QThread | None = None
+        self.loading_worker: ImageLoadWorker | None = None
+        self.loading_session = 0
         self.tagging_thread: QThread | None = None
         self.tagging_worker: TaggingWorker | None = None
+        self.translation_thread: QThread | None = None
+        self.translation_worker: TranslationWorker | None = None
+        self.translation_window: TranslationDictionaryWindow | None = None
+        self.translation_store = TagTranslationStore()
         self.tagging_rows = []
 
         self.folder_input = QLineEdit()
@@ -1533,6 +2082,13 @@ class ImageFolderViewer(QMainWindow):
         self.always_ext_input = QLineEdit(DEFAULT_ALWAYS_EXTS)
         self.extra_ext_input = QLineEdit()
         self.model_dir_input = QLineEdit(str(default_model_dir()))
+        self.translation_csv_input = QLineEdit(str(default_tag_dictionary_path()))
+        self.translation_model_input = QLineEdit(str(default_translation_model_dir()))
+        self.show_tag_translations = QCheckBox("日本語タグを表示")
+        self.show_tag_translations.setChecked(True)
+        self.show_tag_translations.stateChanged.connect(self.refresh_translation_views)
+        self.ai_translate_missing = QCheckBox("未翻訳タグをAI翻訳して辞書に保存")
+        self.ai_translate_missing.setChecked(False)
 
         self.max_images = QSpinBox()
         self.max_images.setRange(10, 5000)
@@ -1550,7 +2106,13 @@ class ImageFolderViewer(QMainWindow):
         self.tile_size_timer = QTimer(self)
         self.tile_size_timer.setSingleShot(True)
         self.tile_size_timer.timeout.connect(self.render_tiles)
-        self.tile_size.valueChanged.connect(lambda _value: self.tile_size_timer.start(120))
+        self.tile_size.sliderPressed.connect(self.on_tile_size_slider_pressed)
+        self.tile_size.sliderReleased.connect(self.on_tile_size_slider_released)
+        self.tile_size.valueChanged.connect(self.on_tile_size_changed)
+        self.resizing_tiles = False
+        self.tag_update_timer = QTimer(self)
+        self.tag_update_timer.setSingleShot(True)
+        self.tag_update_timer.timeout.connect(self.populate_tags)
         self.slide_interval = QSpinBox()
         self.slide_interval.setRange(1, 30)
         self.slide_interval.setValue(2)
@@ -1590,6 +2152,7 @@ class ImageFolderViewer(QMainWindow):
 
         self.statusBar().showMessage("画像フォルダを選択してください。")
         self._build_ui()
+        self.load_translation_csv(show_message=False)
 
     def _build_ui(self):
         toolbar = QToolBar("main")
@@ -1666,6 +2229,35 @@ class ImageFolderViewer(QMainWindow):
         model_layout.addRow(prepare_button)
         layout.addWidget(model_group)
 
+        translation_group = QGroupBox("タグ翻訳")
+        translation_layout = QFormLayout(translation_group)
+        translation_layout.addRow(self.show_tag_translations)
+        translation_layout.addRow(self.ai_translate_missing)
+        translation_csv_button = QPushButton("タグ翻訳CSVを選択")
+        translation_csv_button.clicked.connect(self.choose_translation_csv)
+        translation_layout.addRow(translation_csv_button)
+        translation_layout.addRow("タグ翻訳CSV", self.translation_csv_input)
+        load_translation_csv_button = QPushButton("CSV辞書を読み込み")
+        load_translation_csv_button.clicked.connect(self.load_translation_csv)
+        translation_layout.addRow(load_translation_csv_button)
+        translation_model_button = QPushButton("翻訳モデルフォルダ選択")
+        translation_model_button.clicked.connect(self.choose_translation_model_folder)
+        translation_layout.addRow(translation_model_button)
+        translation_layout.addRow("翻訳モデル", self.translation_model_input)
+        prepare_translation_button = QPushButton("翻訳モデルをローカル準備")
+        prepare_translation_button.clicked.connect(self.prepare_translation_model)
+        translation_layout.addRow(prepare_translation_button)
+        ai_translate_button = QPushButton("表示中タグの未翻訳をAI翻訳")
+        ai_translate_button.clicked.connect(self.run_ai_tag_translation)
+        translation_layout.addRow(ai_translate_button)
+        edit_translation_button = QPushButton("翻訳辞書を編集")
+        edit_translation_button.clicked.connect(self.open_translation_dictionary)
+        translation_layout.addRow(edit_translation_button)
+        reload_translation_button = QPushButton("翻訳辞書を再読み込み")
+        reload_translation_button.clicked.connect(self.reload_translation_dictionary)
+        translation_layout.addRow(reload_translation_button)
+        layout.addWidget(translation_group)
+
         dup_group = QGroupBox("重複確認")
         dup_layout = QFormLayout(dup_group)
         dup_layout.addRow("しきい値", self.duplicate_threshold)
@@ -1735,6 +2327,135 @@ class ImageFolderViewer(QMainWindow):
         if folder:
             self.model_dir_input.setText(folder)
 
+    def choose_translation_model_folder(self):
+        folder = QFileDialog.getExistingDirectory(self, "翻訳モデルフォルダを選択", self.translation_model_input.text())
+        if folder:
+            self.translation_model_input.setText(folder)
+
+    def choose_translation_csv(self):
+        path, _selected = QFileDialog.getOpenFileName(
+            self,
+            "タグ翻訳CSVを選択",
+            self.translation_csv_input.text(),
+            "CSV files (*.csv);;All files (*.*)",
+        )
+        if path:
+            self.translation_csv_input.setText(path)
+            self.load_translation_csv()
+
+    def load_translation_csv(self, show_message: bool = True):
+        path = Path(self.translation_csv_input.text().strip() or default_tag_dictionary_path())
+        try:
+            loaded, skipped = self.translation_store.load_external_csv(path)
+        except Exception as exc:
+            if show_message:
+                QMessageBox.critical(self, "CSV辞書読み込み失敗", str(exc))
+            return
+        self.refresh_translation_views()
+        if self.translation_window is not None and self.translation_window.isVisible():
+            self.translation_window.reload()
+        if show_message:
+            self.statusBar().showMessage(f"CSV辞書を読み込みました: {loaded}件 / skipped {skipped}件")
+
+    def open_translation_dictionary(self):
+        if self.translation_window is None:
+            self.translation_window = TranslationDictionaryWindow(self)
+        else:
+            self.translation_window.reload()
+        self.translation_window.show()
+        self.translation_window.raise_()
+        self.translation_window.activateWindow()
+
+    def reload_translation_dictionary(self):
+        self.translation_store.load()
+        self.load_translation_csv()
+        self.refresh_translation_views()
+        if self.translation_window is not None and self.translation_window.isVisible():
+            self.translation_window.reload()
+        self.statusBar().showMessage("タグ翻訳辞書を再読み込みしました。")
+
+    def refresh_translation_views(self):
+        if self.detail_window is not None and self.detail_window.isVisible():
+            self.detail_window.update_info()
+
+    def collect_visible_tags(self) -> list[str]:
+        tags: set[str] = set()
+        for index in self.visible_indexes:
+            if 0 <= index < len(self.items):
+                tags.update(self.items[index].tags)
+        return sorted(tags)
+
+    def untranslated_visible_tags(self) -> list[str]:
+        return [tag for tag in self.collect_visible_tags() if not self.translation_store.translate(tag)]
+
+    def prepare_translation_model(self):
+        model_dir = Path(self.translation_model_input.text().strip() or default_translation_model_dir())
+        model_dir.mkdir(parents=True, exist_ok=True)
+        if translation_model_ready(model_dir):
+            QMessageBox.information(self, "翻訳モデル準備完了", f"必要ファイルはすでに揃っています。\n{model_dir}")
+            return
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        try:
+            code = r'''
+import sys
+from pathlib import Path
+
+from huggingface_hub import snapshot_download
+
+repo_id = sys.argv[1]
+model_dir = Path(sys.argv[2])
+model_dir.mkdir(parents=True, exist_ok=True)
+snapshot_download(repo_id=repo_id, local_dir=str(model_dir), local_dir_use_symlinks=False)
+'''
+            run_external_python(code, [TRANSLATION_MODEL_REPO, str(model_dir)], timeout=900)
+            if not translation_model_ready(model_dir):
+                missing = sorted(filename for filename in TRANSLATION_REQUIRED_FILES if not (model_dir / filename).exists())
+                raise FileNotFoundError("翻訳モデルの必要ファイルが不足しています: " + ", ".join(missing))
+        except Exception as exc:
+            QMessageBox.critical(self, "翻訳モデル準備失敗", str(exc))
+            return
+        finally:
+            QApplication.restoreOverrideCursor()
+        QMessageBox.information(self, "翻訳モデル準備完了", str(model_dir))
+
+    def run_ai_tag_translation(self):
+        if self.translation_thread is not None and self.translation_thread.isRunning():
+            QMessageBox.information(self, "AI翻訳", "AI翻訳はすでに実行中です。")
+            return
+        tags = self.untranslated_visible_tags()
+        if not tags:
+            QMessageBox.information(self, "AI翻訳", "表示中画像に未翻訳タグはありません。")
+            return
+        model_dir = Path(self.translation_model_input.text().strip() or default_translation_model_dir())
+        self.translation_thread = QThread(self)
+        self.translation_worker = TranslationWorker(tags, model_dir)
+        self.translation_worker.moveToThread(self.translation_thread)
+        self.translation_thread.started.connect(self.translation_worker.run)
+        self.translation_worker.finished.connect(self.on_translation_finished)
+        self.translation_worker.error.connect(self.on_translation_error)
+        self.translation_worker.finished.connect(self.translation_thread.quit)
+        self.translation_worker.error.connect(self.translation_thread.quit)
+        self.translation_thread.finished.connect(self.translation_worker.deleteLater)
+        self.translation_thread.finished.connect(self.translation_thread.deleteLater)
+        self.translation_thread.finished.connect(self.clear_translation_thread)
+        self.statusBar().showMessage(f"AI翻訳中: {len(tags)}タグ")
+        self.translation_thread.start()
+
+    def on_translation_finished(self, translations: dict):
+        self.translation_store.merge_translations({str(key): str(value) for key, value in translations.items()})
+        self.refresh_translation_views()
+        if self.translation_window is not None and self.translation_window.isVisible():
+            self.translation_window.reload()
+        self.statusBar().showMessage(f"AI翻訳が完了しました: {len(translations)}タグ")
+
+    def on_translation_error(self, message: str):
+        QMessageBox.critical(self, "AI翻訳失敗", message)
+        self.statusBar().showMessage("AI翻訳に失敗しました。")
+
+    def clear_translation_thread(self):
+        self.translation_thread = None
+        self.translation_worker = None
+
     def refresh_extensions(self):
         folder = self.folder_input.text().strip()
         if not folder or not Path(folder).is_dir():
@@ -1763,26 +2484,87 @@ class ImageFolderViewer(QMainWindow):
             QMessageBox.warning(self, "拡張子未指定", "読み込む拡張子を指定してください。")
             return
         self.stop_slideshow()
-        self.statusBar().showMessage("画像を読み込み中...")
-        QApplication.setOverrideCursor(Qt.WaitCursor)
-        try:
-            self.items, skipped = load_images_from_folder(
-                folder,
-                max_images=self.max_images.value(),
-                max_side=self.max_side.value(),
-                include_subfolders=self.include_subfolders.isChecked(),
-                enabled_exts=enabled_exts,
-            )
-        except Exception as exc:
-            QMessageBox.critical(self, "読み込み失敗", str(exc))
-            self.items = []
-            skipped = {}
-        finally:
-            QApplication.restoreOverrideCursor()
+        self.stop_loading()
+        self.items = []
+        self.visible_indexes = []
+        self.selected_index = -1
+        self.tile_widgets.clear()
+        self.tile_pixmap_cache.clear()
+        self.last_tile_columns = 0
+        self.last_tile_size = 0
+        self.tag_list.clear()
+        self.clear_tile_grid()
+        loading_label = QLabel("画像を読み込み中...")
+        loading_label.setAlignment(Qt.AlignCenter)
+        self.tile_grid.addWidget(loading_label, 0, 0)
+
+        self.loading_thread = QThread(self)
+        self.loading_worker = ImageLoadWorker(
+            folder,
+            max_images=self.max_images.value(),
+            max_side=self.max_side.value(),
+            include_subfolders=self.include_subfolders.isChecked(),
+            enabled_exts=enabled_exts,
+        )
+        self.loading_session += 1
+        session = self.loading_session
+        self.loading_worker.moveToThread(self.loading_thread)
+        self.loading_thread.started.connect(self.loading_worker.run)
+        self.loading_worker.batch_loaded.connect(lambda batch, current=session: self.on_image_batch_loaded(current, batch))
+        self.loading_worker.progress.connect(lambda loaded, scanned, current=session: self.on_image_load_progress(current, loaded, scanned))
+        self.loading_worker.finished.connect(lambda skipped, current=session: self.on_image_load_finished(current, skipped))
+        self.loading_worker.error.connect(lambda message, current=session: self.on_image_load_error(current, message))
+        self.loading_worker.finished.connect(self.loading_thread.quit)
+        self.loading_worker.error.connect(self.loading_thread.quit)
+        self.loading_thread.finished.connect(self.loading_worker.deleteLater)
+        self.loading_thread.finished.connect(self.loading_thread.deleteLater)
+        self.loading_thread.finished.connect(lambda current=session: self.clear_loading_thread(current))
+        self.statusBar().showMessage("画像を読み込み中: 0枚")
+        self.loading_thread.start()
+
+    def stop_loading(self):
+        if self.loading_worker is not None:
+            self.loading_worker.stop()
+
+    def clear_loading_thread(self, session: int):
+        if session != self.loading_session:
+            return
+        self.loading_thread = None
+        self.loading_worker = None
+
+    def on_image_batch_loaded(self, session: int, batch: list):
+        if session != self.loading_session:
+            return
+        start_index = len(self.items)
+        self.items.extend(batch)
+        new_indexes = list(range(start_index, len(self.items)))
+        self.visible_indexes.extend(new_indexes)
+        self.append_tiles_for_indexes(new_indexes)
+        if self.selected_index < 0 and self.items:
+            self.select_image(0, open_detail=False)
+        self.tag_update_timer.start(400)
+        self.statusBar().showMessage(f"画像を読み込み中: {len(self.items)}枚")
+
+    def on_image_load_progress(self, session: int, loaded: int, scanned: int):
+        if session != self.loading_session:
+            return
+        self.statusBar().showMessage(f"画像を読み込み中: {loaded}枚 / scanned {scanned}")
+
+    def on_image_load_finished(self, session: int, skipped: dict):
+        if session != self.loading_session:
+            return
+        self.tag_update_timer.stop()
         self.populate_tags()
-        self.set_visible_indexes(list(range(len(self.items))))
         skipped_text = f" / skipped: {sum(skipped.values())}" if skipped else ""
         self.statusBar().showMessage(f"読み込み完了: {len(self.items)}枚{skipped_text}")
+        if self.ai_translate_missing.isChecked():
+            QTimer.singleShot(0, self.run_ai_tag_translation)
+
+    def on_image_load_error(self, session: int, message: str):
+        if session != self.loading_session:
+            return
+        QMessageBox.critical(self, "読み込み失敗", message)
+        self.statusBar().showMessage("画像読み込みに失敗しました。")
 
     def populate_tags(self):
         tag_counts: dict[str, int] = {}
@@ -1795,13 +2577,14 @@ class ImageFolderViewer(QMainWindow):
 
     def set_visible_indexes(self, indexes: list[int]):
         self.visible_indexes = indexes
+        self.last_tile_columns = 0
         self.render_tiles()
         if indexes:
             self.select_image(indexes[0], open_detail=False)
         else:
             self.selected_index = -1
 
-    def render_tiles(self):
+    def clear_tile_grid(self):
         while self.tile_grid.count():
             item = self.tile_grid.takeAt(0)
             widget = item.widget()
@@ -1809,25 +2592,103 @@ class ImageFolderViewer(QMainWindow):
                 widget.deleteLater()
         self.tile_widgets.clear()
 
-        if not self.visible_indexes:
-            empty = QLabel("該当する画像がありません。")
-            empty.setAlignment(Qt.AlignCenter)
-            self.tile_grid.addWidget(empty, 0, 0)
-            return
+    def on_tile_size_slider_pressed(self):
+        self.resizing_tiles = True
 
+    def on_tile_size_changed(self, _value: int):
+        delay = 300 if self.resizing_tiles else 120
+        self.tile_size_timer.start(delay)
+
+    def on_tile_size_slider_released(self):
+        self.resizing_tiles = False
+        self.tile_size_timer.stop()
+        self.render_tiles()
+
+    def cached_tile_pixmap(self, item_index: int, tile_size: int) -> QPixmap:
+        key = (item_index, tile_size)
+        pixmap = self.tile_pixmap_cache.get(key)
+        if pixmap is None:
+            pixmap = pil_to_pixmap(self.items[item_index].image).scaled(
+                tile_size,
+                tile_size,
+                Qt.KeepAspectRatio,
+                Qt.FastTransformation,
+            )
+            self.tile_pixmap_cache[key] = pixmap
+            if len(self.tile_pixmap_cache) > 2500:
+                current_size = self.tile_size.value()
+                self.tile_pixmap_cache = {
+                    cache_key: cache_pixmap
+                    for cache_key, cache_pixmap in self.tile_pixmap_cache.items()
+                    if cache_key[1] == current_size
+                }
+        return pixmap
+
+    def append_tiles_for_indexes(self, new_indexes: list[int]):
+        if not new_indexes:
+            return
         tile_size = self.tile_size.value()
         viewport_width = max(360, self.tile_area.viewport().width())
         columns = max(1, viewport_width // (tile_size + 8))
-        for visible_pos, item_index in enumerate(self.visible_indexes):
-            widget = TileWidget(self.items[item_index], item_index, tile_size, self.select_image)
-            row = visible_pos // columns
-            col = visible_pos % columns
-            self.tile_grid.addWidget(widget, row, col)
-            self.tile_widgets.append(widget)
+        if not self.tile_widgets or columns != self.last_tile_columns or tile_size != self.last_tile_size:
+            self.render_tiles()
+            return
+
+        self.tile_area.setUpdatesEnabled(False)
+        try:
+            start_pos = len(self.visible_indexes) - len(new_indexes)
+            for offset, item_index in enumerate(new_indexes):
+                visible_pos = start_pos + offset
+                widget = TileWidget(
+                    self.items[item_index],
+                    item_index,
+                    tile_size,
+                    self.select_image,
+                    self.cached_tile_pixmap(item_index, tile_size),
+                )
+                self.tile_grid.addWidget(widget, visible_pos // columns, visible_pos % columns)
+                self.tile_widgets.append(widget)
+        finally:
+            self.tile_area.setUpdatesEnabled(True)
+
+    def render_tiles(self):
+        self.tile_area.setUpdatesEnabled(False)
+        try:
+            self.clear_tile_grid()
+
+            if not self.visible_indexes:
+                empty = QLabel("該当する画像がありません。")
+                empty.setAlignment(Qt.AlignCenter)
+                self.tile_grid.addWidget(empty, 0, 0)
+                return
+
+            tile_size = self.tile_size.value()
+            viewport_width = max(360, self.tile_area.viewport().width())
+            columns = max(1, viewport_width // (tile_size + 8))
+            for visible_pos, item_index in enumerate(self.visible_indexes):
+                widget = TileWidget(
+                    self.items[item_index],
+                    item_index,
+                    tile_size,
+                    self.select_image,
+                    self.cached_tile_pixmap(item_index, tile_size),
+                )
+                row = visible_pos // columns
+                col = visible_pos % columns
+                self.tile_grid.addWidget(widget, row, col)
+                self.tile_widgets.append(widget)
+            self.last_tile_columns = columns
+            self.last_tile_size = tile_size
+        finally:
+            self.tile_area.setUpdatesEnabled(True)
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
-        self.render_tiles()
+        tile_size = self.tile_size.value()
+        viewport_width = max(360, self.tile_area.viewport().width())
+        columns = max(1, viewport_width // (tile_size + 8))
+        if columns != self.last_tile_columns:
+            self.tile_size_timer.start(160)
 
     def open_detail_window(self, freeze=False):
         if self.selected_index < 0 or self.selected_index >= len(self.items):
@@ -1873,6 +2734,11 @@ class ImageFolderViewer(QMainWindow):
         item.raw_image = Image.open(io.BytesIO(item.bytes_data))
         item.image = item.raw_image.convert("RGB")
         item.image.thumbnail((old_side, old_side))
+        item_index = next((index for index, current in enumerate(self.items) if current is item), None)
+        if item_index is not None:
+            self.tile_pixmap_cache = {
+                cache_key: pixmap for cache_key, pixmap in self.tile_pixmap_cache.items() if cache_key[0] != item_index
+            }
         tag_scores, tag_model = extract_ai_tag_scores(item.raw_image)
         item.tag_scores = tag_scores
         if tag_model:
@@ -2051,6 +2917,8 @@ class ImageFolderViewer(QMainWindow):
         if not deleted_paths:
             return
         self.items = [item for item in self.items if item.path not in deleted_paths]
+        self.tile_pixmap_cache.clear()
+        self.last_tile_columns = 0
         self.populate_tags()
         self.set_visible_indexes(list(range(len(self.items))))
 
