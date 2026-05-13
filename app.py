@@ -19,6 +19,302 @@ ASYNC_JOBS: Dict[str, Dict[str, object]] = {}
 ASYNC_LOCK = threading.Lock()
 
 
+RHYTHM_GAME_DIR = Path("rhythm_game_library")
+RHYTHM_SONGS_DIR = RHYTHM_GAME_DIR / "songs"
+RHYTHM_RECORDS_PATH = RHYTHM_GAME_DIR / "records.json"
+RHYTHM_DIFFICULTIES = {
+    "easy": {"label": "かんたん", "level": 2, "beat_step": 2.0},
+    "normal": {"label": "ふつう", "level": 4, "beat_step": 1.5},
+    "hard": {"label": "むずかしい", "level": 6, "beat_step": 1.0},
+    "oni": {"label": "おに", "level": 8, "beat_step": 0.5},
+}
+
+
+def ensure_rhythm_game_dirs() -> None:
+    RHYTHM_SONGS_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def slugify_song_id(title: str) -> str:
+    slug = re.sub(r"[^a-zA-Z0-9_\-]+", "_", title.strip().lower()).strip("_")
+    return slug or f"song_{int(time.time())}"
+
+
+def rhythm_default_records() -> dict:
+    return {"plays": [], "records": {}, "experience": 0}
+
+
+def load_rhythm_records() -> dict:
+    ensure_rhythm_game_dirs()
+    if not RHYTHM_RECORDS_PATH.exists():
+        return rhythm_default_records()
+    try:
+        data = json.loads(RHYTHM_RECORDS_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        return rhythm_default_records()
+    if not isinstance(data, dict):
+        return rhythm_default_records()
+    default = rhythm_default_records()
+    default.update({k: data.get(k, default[k]) for k in default})
+    return default
+
+
+def save_rhythm_records(records: dict) -> None:
+    ensure_rhythm_game_dirs()
+    RHYTHM_RECORDS_PATH.write_text(json.dumps(records, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def rhythm_level_from_exp(exp: int) -> Tuple[int, int, int]:
+    level = int(exp // 1000) + 1
+    current = int(exp % 1000)
+    return level, current, 1000
+
+
+def list_installed_rhythm_songs() -> List[dict]:
+    ensure_rhythm_game_dirs()
+    songs: List[dict] = []
+    for song_json in sorted(RHYTHM_SONGS_DIR.glob("*/song.json")):
+        try:
+            data = json.loads(song_json.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        data["folder"] = str(song_json.parent)
+        songs.append(data)
+    return songs
+
+
+def generate_rhythm_chart(duration_sec: int, bpm: int, difficulty_key: str, offset_ms: int = 0) -> dict:
+    spec = RHYTHM_DIFFICULTIES[difficulty_key]
+    beat_ms = 60000.0 / max(1, bpm)
+    step_ms = beat_ms * float(spec["beat_step"])
+    start_ms = max(500, offset_ms + int(beat_ms * 2))
+    end_ms = max(start_ms, int(duration_sec * 1000) - 1200)
+    notes = []
+    idx = 0
+    t = start_ms
+    while t <= end_ms:
+        if difficulty_key in {"hard", "oni"} and idx > 0 and idx % 32 == 0:
+            notes.append({"timeMs": int(t), "type": "roll", "durationMs": int(beat_ms * 2)})
+            t += step_ms * 2
+            idx += 1
+            continue
+        if idx % 16 == 0 and difficulty_key in {"normal", "hard", "oni"}:
+            note_type = "bigDon" if idx % 32 == 0 else "bigKa"
+        else:
+            note_type = "don" if idx % 3 != 1 else "ka"
+        notes.append({"timeMs": int(t), "type": note_type})
+        t += step_ms
+        idx += 1
+    return {
+        "difficulty": difficulty_key,
+        "label": spec["label"],
+        "level": spec["level"],
+        "offsetMs": offset_ms,
+        "notes": notes,
+    }
+
+
+def write_rhythm_charts(song_dir: Path, duration_sec: int, bpm: int, offset_ms: int = 0) -> dict:
+    chart_dir = song_dir / "charts"
+    chart_dir.mkdir(parents=True, exist_ok=True)
+    summary = {}
+    for difficulty_key in RHYTHM_DIFFICULTIES:
+        chart = generate_rhythm_chart(duration_sec, bpm, difficulty_key, offset_ms)
+        (chart_dir / f"{difficulty_key}.json").write_text(json.dumps(chart, ensure_ascii=False, indent=2), encoding="utf-8")
+        summary[difficulty_key] = len(chart["notes"])
+    return summary
+
+
+def install_rhythm_song(uploaded_audio, title: str, artist: str, bpm: int, duration_sec: int, genre: str) -> dict:
+    ensure_rhythm_game_dirs()
+    base_id = slugify_song_id(title)
+    song_id = base_id
+    counter = 2
+    while (RHYTHM_SONGS_DIR / song_id).exists():
+        song_id = f"{base_id}_{counter}"
+        counter += 1
+    song_dir = RHYTHM_SONGS_DIR / song_id
+    song_dir.mkdir(parents=True, exist_ok=True)
+    source_name = Path(uploaded_audio.name)
+    audio_suffix = source_name.suffix.lower() if source_name.suffix else ".audio"
+    audio_name = f"audio{audio_suffix}"
+    (song_dir / audio_name).write_bytes(uploaded_audio.getbuffer())
+    chart_counts = write_rhythm_charts(song_dir, duration_sec, bpm)
+    song = {
+        "id": song_id,
+        "title": title.strip() or song_id,
+        "artist": artist.strip() or "Unknown",
+        "bpm": int(bpm),
+        "durationSec": int(duration_sec),
+        "genre": genre.strip() or "未分類",
+        "audio": audio_name,
+        "preview": audio_name,
+        "jacket": "",
+        "backgrounds": {},
+        "installedAt": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "chartCounts": chart_counts,
+    }
+    (song_dir / "song.json").write_text(json.dumps(song, ensure_ascii=False, indent=2), encoding="utf-8")
+    return song
+
+
+def calculate_rank(score: int) -> str:
+    if score >= 980000:
+        return "SS"
+    if score >= 920000:
+        return "S"
+    if score >= 850000:
+        return "A"
+    if score >= 750000:
+        return "B"
+    if score >= 600000:
+        return "C"
+    return "D"
+
+
+def add_rhythm_play_record(song: dict, difficulty: str, score: int, full_combo: bool, all_perfect: bool) -> dict:
+    records = load_rhythm_records()
+    rank = calculate_rank(score)
+    exp_gain = max(10, int(score / 10000)) + (80 if full_combo else 0) + (150 if all_perfect else 0)
+    play = {
+        "playedAt": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "songId": song["id"],
+        "title": song["title"],
+        "difficulty": difficulty,
+        "score": int(score),
+        "rank": rank,
+        "fullCombo": bool(full_combo),
+        "allPerfect": bool(all_perfect),
+        "expGain": exp_gain,
+    }
+    records["plays"].insert(0, play)
+    records["plays"] = records["plays"][:100]
+    song_records = records["records"].setdefault(song["id"], {})
+    previous = song_records.get(difficulty, {})
+    if int(score) > int(previous.get("bestScore", 0)):
+        song_records[difficulty] = {
+            "title": song["title"],
+            "bestScore": int(score),
+            "bestRank": rank,
+            "fullCombo": bool(full_combo) or bool(previous.get("fullCombo", False)),
+            "allPerfect": bool(all_perfect) or bool(previous.get("allPerfect", False)),
+            "updatedAt": play["playedAt"],
+        }
+    else:
+        previous["fullCombo"] = bool(full_combo) or bool(previous.get("fullCombo", False))
+        previous["allPerfect"] = bool(all_perfect) or bool(previous.get("allPerfect", False))
+        song_records[difficulty] = previous
+    records["experience"] = int(records.get("experience", 0)) + exp_gain
+    save_rhythm_records(records)
+    return play
+
+
+def flatten_rhythm_scores(records: dict) -> List[dict]:
+    rows = []
+    for song_id, difficulties in records.get("records", {}).items():
+        for difficulty, row in difficulties.items():
+            rows.append({"songId": song_id, "difficulty": difficulty, **row})
+    return sorted(rows, key=lambda row: int(row.get("bestScore", 0)), reverse=True)
+
+
+def render_rhythm_game_home() -> None:
+    ensure_rhythm_game_dirs()
+    songs = list_installed_rhythm_songs()
+    records = load_rhythm_records()
+    plays = records.get("plays", [])
+    score_rows = flatten_rhythm_scores(records)
+    best_score = max([int(row.get("bestScore", 0)) for row in score_rows], default=0)
+    exp = int(records.get("experience", 0))
+    level, current_exp, next_exp = rhythm_level_from_exp(exp)
+
+    st.subheader("🥁 リズムゲーム ホーム")
+    st.caption("現状: 画像ビューアに、楽曲インストール、簡易譜面生成によるリズムゲーム化、履歴・スコア・経験値管理を追加しています。")
+    metric_cols = st.columns(4)
+    metric_cols[0].metric("インストール楽曲", len(songs))
+    metric_cols[1].metric("プレイ履歴", len(plays))
+    metric_cols[2].metric("最高スコア", f"{best_score:,}")
+    metric_cols[3].metric("経験値", f"Lv.{level} / {exp} EXP")
+    st.progress(current_exp / next_exp, text=f"次のレベルまで {next_exp - current_exp} EXP")
+
+    if "rhythm_home_panel" not in st.session_state:
+        st.session_state.rhythm_home_panel = "現状"
+    button_cols = st.columns(6)
+    panels = ["現状", "楽曲インストール", "リズムゲーム化", "履歴", "スコア", "経験値"]
+    for col, panel in zip(button_cols, panels):
+        if col.button(panel, key=f"rhythm_panel_{panel}"):
+            st.session_state.rhythm_home_panel = panel
+
+    panel = st.session_state.rhythm_home_panel
+    if panel == "現状":
+        st.markdown("#### 現状まとめ")
+        st.write(
+            {
+                "追加済み": ["楽曲ファイル保存", "BPMと曲長からの簡易譜面生成", "プレイ履歴保存", "ベストスコア保存", "経験値・レベル表示"],
+                "保存先": str(RHYTHM_GAME_DIR),
+                "次の実装候補": ["実音源に同期したゲーム画面", "譜面エディタ", "リザルト画面との自動連携"],
+            }
+        )
+    elif panel == "楽曲インストール":
+        st.markdown("#### 楽曲のインストール")
+        with st.form("rhythm_install_form"):
+            uploaded_audio = st.file_uploader("音源ファイル", type=["mp3", "wav", "ogg", "m4a"], key="rhythm_audio_upload")
+            title = st.text_input("曲名", value="新しい楽曲")
+            artist = st.text_input("アーティスト", value="Unknown")
+            bpm = st.number_input("BPM", min_value=40, max_value=300, value=120, step=1)
+            duration_sec = st.number_input("曲の長さ（秒）", min_value=10, max_value=900, value=90, step=5)
+            genre = st.text_input("ジャンル", value="未分類")
+            submitted = st.form_submit_button("インストールして譜面を生成")
+        if submitted:
+            if uploaded_audio is None:
+                st.warning("音源ファイルを選択してください。")
+            else:
+                song = install_rhythm_song(uploaded_audio, title, artist, int(bpm), int(duration_sec), genre)
+                st.success(f"{song['title']} をインストールしました。")
+                st.json(song)
+    elif panel == "リズムゲーム化":
+        st.markdown("#### リズムゲーム化機能")
+        if not songs:
+            st.info("先に楽曲をインストールしてください。")
+        else:
+            song_options = {f"{song['title']} / {song['artist']} ({song['id']})": song for song in songs}
+            selected_label = st.selectbox("対象楽曲", list(song_options))
+            song = song_options[selected_label]
+            song_dir = Path(song["folder"])
+            offset_ms = st.number_input("判定オフセット（ms）", min_value=-5000, max_value=5000, value=0, step=10)
+            if st.button("譜面を再生成", key="regenerate_rhythm_chart"):
+                counts = write_rhythm_charts(song_dir, int(song["durationSec"]), int(song["bpm"]), int(offset_ms))
+                song["chartCounts"] = counts
+                song["offsetMs"] = int(offset_ms)
+                (song_dir / "song.json").write_text(json.dumps({k: v for k, v in song.items() if k != "folder"}, ensure_ascii=False, indent=2), encoding="utf-8")
+                st.success("譜面を再生成しました。")
+                st.json(counts)
+            st.markdown("##### 動作確認用プレイ記録")
+            difficulty = st.selectbox("難易度", list(RHYTHM_DIFFICULTIES.keys()), format_func=lambda key: RHYTHM_DIFFICULTIES[key]["label"])
+            score = st.slider("スコア", 0, 1000000, 850000, 1000)
+            full_combo = st.checkbox("フルコンボ")
+            all_perfect = st.checkbox("全良")
+            if st.button("プレイ結果を保存", key="save_rhythm_play"):
+                play = add_rhythm_play_record(song, difficulty, int(score), full_combo, all_perfect)
+                st.success(f"履歴・スコア・経験値を更新しました（+{play['expGain']} EXP）。")
+                st.json(play)
+    elif panel == "履歴":
+        st.markdown("#### プレイ履歴")
+        if plays:
+            st.dataframe(plays, use_container_width=True)
+        else:
+            st.info("プレイ履歴はまだありません。")
+    elif panel == "スコア":
+        st.markdown("#### ベストスコア")
+        if score_rows:
+            st.dataframe(score_rows, use_container_width=True)
+        else:
+            st.info("スコア記録はまだありません。")
+    elif panel == "経験値":
+        st.markdown("#### 経験値")
+        st.write({"level": level, "totalExp": exp, "currentLevelExp": current_exp, "nextLevelExp": next_exp})
+        st.progress(current_exp / next_exp, text=f"Lv.{level}: {current_exp}/{next_exp} EXP")
+        st.caption("スコア保存時に、スコア量・フルコンボ・全良ボーナスから経験値を加算します。")
+
+
 @dataclass
 class ImageItem:
     name: str
@@ -847,6 +1143,9 @@ def run_folder_analysis_job(job_id: str, params: Dict[str, object]):
 def main():
     st.set_page_config(page_title="画像タイルビューア", layout="wide")
     st.title("🖼️ 画像タイル + スライドショー + 詳細情報")
+
+    render_rhythm_game_home()
+    st.divider()
 
     profile = detect_system_profile()
     defaults = get_default_analysis_params(profile)
